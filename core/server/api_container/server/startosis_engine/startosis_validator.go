@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/kurtosis-tech/kurtosis/api/golang/core/kurtosis_core_rpc_api_bindings"
 	"github.com/kurtosis-tech/kurtosis/api/golang/core/lib/binding_constructors"
@@ -62,9 +63,13 @@ func (validator *StartosisValidator) Validate(ctx context.Context, instructionsS
 		defer close(starlarkRunResponseLineStream)
 		isValidationFailure := false
 
+		validatorStart := time.Now()
+		logrus.Infof("[BENCH] StartosisValidator.Validate starting")
+
 		starlarkRunResponseLineStream <- binding_constructors.NewStarlarkRunResponseLineFromSinglelineProgressInfoWithInstructionId(
 			validationInProgressMsg, defaultCurrentStepNumber, defaultTotalStepsNumber, ValidationInstructionId)
 
+		t0 := time.Now()
 		serviceNames, err := validator.serviceNetwork.GetServiceNames()
 		if err != nil {
 			wrappedValidationError := startosis_errors.WrapWithValidationError(err, "An error occurred getting all service names")
@@ -72,7 +77,9 @@ func (validator *StartosisValidator) Validate(ctx context.Context, instructionsS
 			starlarkRunResponseLineStream <- binding_constructors.NewStarlarkRunResponseLineFromRunFailureEvent()
 			return
 		}
+		logrus.Infof("[BENCH] GetServiceNames completed in %s (found %d services)", time.Since(t0), len(serviceNames))
 
+		t1 := time.Now()
 		serviceNamePortIdMapping, err := getServiceNameToPortIDsMap(serviceNames, validator.serviceNetwork)
 		if err != nil {
 			wrappedValidationError := startosis_errors.WrapWithValidationError(err, "Couldn't create validator environment as we ran into errors fetching existing services and ports")
@@ -80,7 +87,9 @@ func (validator *StartosisValidator) Validate(ctx context.Context, instructionsS
 			starlarkRunResponseLineStream <- binding_constructors.NewStarlarkRunResponseLineFromRunFailureEvent()
 			return
 		}
+		logrus.Infof("[BENCH] getServiceNameToPortIDsMap completed in %s", time.Since(t1))
 
+		t2 := time.Now()
 		availableMemoryInMegaBytes, availableCpuInMilliCores, isResourceInformationComplete, err := (*validator.backend).GetAvailableCPUAndMemory(ctx)
 		if err != nil {
 			wrappedValidationError := startosis_errors.WrapWithValidationError(err, "Couldn't create validator environment as we ran into errors fetching information about available cpu & memory")
@@ -88,6 +97,7 @@ func (validator *StartosisValidator) Validate(ctx context.Context, instructionsS
 			starlarkRunResponseLineStream <- binding_constructors.NewStarlarkRunResponseLineFromRunFailureEvent()
 			return
 		}
+		logrus.Infof("[BENCH] GetAvailableCPUAndMemory completed in %s", time.Since(t2))
 
 		environment := startosis_validator.NewValidatorEnvironment(
 			serviceNames,
@@ -97,13 +107,19 @@ func (validator *StartosisValidator) Validate(ctx context.Context, instructionsS
 			availableMemoryInMegaBytes,
 			isResourceInformationComplete,
 			imageDownloadMode)
+		logrus.Infof("[BENCH] validator env setup total completed in %s", time.Since(validatorStart))
 
+		t3 := time.Now()
 		isValidationFailure = isValidationFailure ||
 			validator.validateAndUpdateEnvironment(instructionsSequence, environment, starlarkRunResponseLineStream)
+		logrus.Infof("[BENCH] validateAndUpdateEnvironment completed in %s", time.Since(t3))
 		logrus.Debug("Finished validating environment. Validating container images...")
 
+		t4 := time.Now()
 		isValidationFailure = isValidationFailure ||
 			validator.validateImagesAccountingForProgress(ctx, environment, starlarkRunResponseLineStream)
+		logrus.Infof("[BENCH] validateImagesAccountingForProgress completed in %s", time.Since(t4))
+		logrus.Infof("[BENCH] StartosisValidator.Validate total completed in %s", time.Since(validatorStart))
 
 		if isValidationFailure {
 			logrus.Debug("Errors encountered validating container images.")

@@ -24,6 +24,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"time"
 
 	path_compression "github.com/kurtosis-tech/kurtosis/path-compression"
 
@@ -186,10 +187,12 @@ func (enclaveCtx *EnclaveContext) RunStarlarkPackage(
 		return nil, nil, stacktrace.Propagate(err, "Error preparing package '%s' for execution", packageRootPath)
 	}
 
+	uploadStart := time.Now()
 	err = enclaveCtx.uploadStarlarkPackage(executeStartosisPackageArgs.PackageId, packageRootPath)
 	if err != nil {
 		return nil, nil, stacktrace.Propagate(err, "Error uploading package '%s' prior to executing it", packageRootPath)
 	}
+	logrus.Infof("[BENCH] client-side uploadStarlarkPackage completed in %s", time.Since(uploadStart))
 
 	if len(packageReplaceOptions) > 0 {
 		if err = enclaveCtx.uploadLocalStarlarkPackageDependencies(packageRootPath, packageReplaceOptions); err != nil {
@@ -692,15 +695,21 @@ func (enclaveCtx *EnclaveContext) assembleRunStartosisPackageArg(
 }
 
 func (enclaveCtx *EnclaveContext) uploadStarlarkPackage(packageId string, packageRootPath string) error {
+	uploadTotalStart := time.Now()
+	logrus.Infof("[BENCH] uploadStarlarkPackage starting for '%v' at '%v'", packageId, packageRootPath)
+
+	compressStart := time.Now()
 	logrus.Infof("Compressing package '%v' at '%v' for upload", packageId, packageRootPath)
 	compressedModule, commpressedModuleSize, _, err := path_compression.CompressPath(packageRootPath, enforceMaxFileSizeLimit)
 	if err != nil {
 		return stacktrace.Propagate(err, "There was an error compressing module '%v' before upload", packageRootPath)
 	}
 	defer compressedModule.Close()
+	logrus.Infof("[BENCH] package compression completed in %s (size=%d bytes)", time.Since(compressStart), commpressedModuleSize)
 	logrus.Infof("Uploading and executing package '%v'", packageId)
 
 	// TODO: add content hash to API here as well
+	streamStart := time.Now()
 	client, err := enclaveCtx.client.UploadStarlarkPackage(context.Background())
 	if err != nil {
 		return stacktrace.Propagate(err, "An error was encountered initiating the data upload to the API Container.")
@@ -723,6 +732,9 @@ func (enclaveCtx *EnclaveContext) uploadStarlarkPackage(packageId string, packag
 	if err != nil {
 		return stacktrace.Propagate(err, "An error was encountered while uploading data to the API Container.")
 	}
+	logrus.Infof("[BENCH] package stream upload completed in %s", time.Since(streamStart))
+
+	logrus.Infof("[BENCH] uploadStarlarkPackage total completed in %s", time.Since(uploadTotalStart))
 	return nil
 }
 

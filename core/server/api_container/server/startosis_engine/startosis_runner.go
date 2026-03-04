@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kurtosis-tech/kurtosis/api/golang/core/kurtosis_core_rpc_api_bindings"
 	"github.com/kurtosis-tech/kurtosis/api/golang/core/lib/binding_constructors"
@@ -89,6 +90,8 @@ func (runner *StartosisRunner) Run(
 		for _, experimentalFeature := range experimentalFeatures {
 			experimentalFeaturesStr = append(experimentalFeaturesStr, experimentalFeature.String())
 		}
+		runnerStart := time.Now()
+		logrus.Infof("[BENCH] StartosisRunner.Run starting")
 		logrus.Infof("Executing Starlark package '%s' with the following parameters: dry-run: '%v', parallelism: '%d', experimental features: '%s', main function name: '%s', params: '%s'",
 			packageId,
 			dryRun,
@@ -104,6 +107,7 @@ func (runner *StartosisRunner) Run(
 
 		// TODO: once we have feature flags, add a switch here to call InterpretAndOptimizePlan if the feature flag is
 		//  turned on
+		interpretStart := time.Now()
 		var serializedScriptOutput string
 		var instructionsPlan *instructions_plan.InstructionsPlan
 		var interpretationError *kurtosis_core_rpc_api_bindings.StarlarkInterpretationError
@@ -136,6 +140,7 @@ func (runner *StartosisRunner) Run(
 				imageDownloadMode,
 			)
 		}
+		logrus.Infof("[BENCH] interpretation completed in %s", time.Since(interpretStart))
 
 		if interpretationError != nil {
 			starlarkRunResponseLines <- binding_constructors.NewStarlarkRunResponseLineFromInterpretationError(interpretationError)
@@ -165,6 +170,7 @@ func (runner *StartosisRunner) Run(
 			startingValidationMsg, defaultCurrentStepNumber, totalNumberOfInstructions, ValidationInstructionId)
 		starlarkRunResponseLines <- progressInfo
 
+		validationStart := time.Now()
 		validationErrorsChan := runner.startosisValidator.Validate(ctx, instructionsSequence, imageDownloadMode)
 		if isRunFinished, isRunSuccessful := forwardKurtosisResponseLineChannelUntilSourceIsClosed(validationErrorsChan, starlarkRunResponseLines); isRunFinished {
 			if !isRunSuccessful {
@@ -172,6 +178,7 @@ func (runner *StartosisRunner) Run(
 			}
 			return
 		}
+		logrus.Infof("[BENCH] validation phase completed in %s", time.Since(validationStart))
 		logrus.Debugf("Successfully validated Starlark script")
 
 		// Execution starts > send progress info. This will soon be overridden byt the first instruction execution
@@ -179,6 +186,7 @@ func (runner *StartosisRunner) Run(
 			startingExecutionMsg, defaultCurrentStepNumber, totalNumberOfInstructions, ExecutionInstructionId)
 		starlarkRunResponseLines <- progressInfo
 
+		executionStart := time.Now()
 		var executionResponseLinesChan <-chan *kurtosis_core_rpc_api_bindings.StarlarkRunResponseLine
 		if shouldExecuteInParallel {
 			logrus.Infof("Executing Kurtosis instructions in parallel with parallelism: %d", parallelism)
@@ -194,6 +202,8 @@ func (runner *StartosisRunner) Run(
 		} else {
 			logrus.Debugf("Successfully executed Kurtosis plan composed of %d Kurtosis instructions", totalNumberOfInstructions)
 		}
+		logrus.Infof("[BENCH] execution phase completed in %s", time.Since(executionStart))
+		logrus.Infof("[BENCH] StartosisRunner.Run total completed in %s", time.Since(runnerStart))
 	}()
 	return starlarkRunResponseLines
 }

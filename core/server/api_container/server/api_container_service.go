@@ -238,6 +238,7 @@ func (apicService *ApiContainerService) saveStarlarkRun(
 
 // Uploads a Starlark package for later execution
 func (apicService *ApiContainerService) UploadStarlarkPackage(server kurtosis_core_rpc_api_bindings.ApiContainerService_UploadStarlarkPackageServer) error {
+	uploadStart := time.Now()
 	var packageId string
 	serverStream := grpc_file_streaming.NewServerStream[kurtosis_core_rpc_api_bindings.StreamedDataChunk, emptypb.Empty](server)
 
@@ -257,10 +258,12 @@ func (apicService *ApiContainerService) UploadStarlarkPackage(server kurtosis_co
 			}
 
 			// finished receiving all the chunks and assembling them into a single byte array
+			storeStart := time.Now()
 			_, interpretationError := apicService.packageContentProvider.StorePackageContents(packageId, assembledContent, doOverwriteExistingModule)
 			if interpretationError != nil {
 				return nil, stacktrace.Propagate(interpretationError, "Error storing package in APIC once received")
 			}
+			logrus.Infof("[BENCH] package store/decompress completed in %s", time.Since(storeStart))
 			return &emptypb.Empty{}, nil
 		},
 	)
@@ -268,6 +271,7 @@ func (apicService *ApiContainerService) UploadStarlarkPackage(server kurtosis_co
 	if err != nil {
 		return stacktrace.Propagate(err, "An error occurred receiving the Starlark package payload")
 	}
+	logrus.Infof("[BENCH] UploadStarlarkPackage total completed in %s", time.Since(uploadStart))
 	return nil
 }
 
