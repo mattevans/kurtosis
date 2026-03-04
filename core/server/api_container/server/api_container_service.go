@@ -306,6 +306,8 @@ func (apicService *ApiContainerService) InspectFilesArtifactContents(_ context.C
 }
 
 func (apicService *ApiContainerService) RunStarlarkPackage(args *kurtosis_core_rpc_api_bindings.RunStarlarkPackageArgs, stream kurtosis_core_rpc_api_bindings.ApiContainerService_RunStarlarkPackageServer) error {
+	runPkgStart := time.Now()
+	logrus.Infof("[BENCH] RunStarlarkPackage handler starting")
 
 	var scriptWithRunFunction string
 	var interpretationError *startosis_errors.InterpretationError
@@ -369,6 +371,7 @@ func (apicService *ApiContainerService) RunStarlarkPackage(args *kurtosis_core_r
 		actualRelativePathToMainFile,
 		scriptWithRunFunction,
 		serializedParams)
+	logrus.Infof("[BENCH] RunStarlarkPackage setup completed in %s", time.Since(runPkgStart))
 	apicService.runStarlark(
 		int(parallelism),
 		dryRun,
@@ -383,6 +386,7 @@ func (apicService *ApiContainerService) RunStarlarkPackage(args *kurtosis_core_r
 		shouldExecuteInParallel,
 		args.ExperimentalFeatures,
 		stream)
+	logrus.Infof("[BENCH] RunStarlarkPackage total completed in %s", time.Since(runPkgStart))
 
 	return nil
 }
@@ -963,20 +967,25 @@ func (apicService *ApiContainerService) runStarlarkPackageSetup(
 	string, // Detected Package ID detected from [clonePackage] or [moduleContentIfLocal]
 	map[string]string, // Replace options detected from [clonePackage] or [moduleContentIfLocal]
 	*startosis_errors.InterpretationError) {
+	setupStart := time.Now()
 	var packageRootPathOnDisk string
 	var interpretationError *startosis_errors.InterpretationError
 
 	if clonePackage {
+		logrus.Infof("[BENCH] runStarlarkPackageSetup: cloning package '%s'", packageIdFromArgs)
 		packageRootPathOnDisk, interpretationError = apicService.packageContentProvider.ClonePackage(packageIdFromArgs)
 	} else if moduleContentIfLocal != nil {
+		logrus.Infof("[BENCH] runStarlarkPackageSetup: storing local module content for '%s'", packageIdFromArgs)
 		// TODO: remove this once UploadStarlarkPackage is called prior to calling RunStarlarkPackage by all consumers of this API
 		packageRootPathOnDisk, interpretationError = apicService.packageContentProvider.StorePackageContents(packageIdFromArgs, bytes.NewReader(moduleContentIfLocal), doOverwriteExistingModule)
 	} else {
+		logrus.Infof("[BENCH] runStarlarkPackageSetup: getting on-disk path for '%s'", packageIdFromArgs)
 		// We just need to retrieve the absolute path, the content will not be stored here since it has been uploaded prior to this call
 		// This is used in the flow where we `replace` with a local call, in which case we need to store multiple packages on the APIC
 		// before we actually do the run
 		packageRootPathOnDisk, interpretationError = apicService.packageContentProvider.GetOnDiskAbsolutePackagePath(packageIdFromArgs)
 	}
+	logrus.Infof("[BENCH] runStarlarkPackageSetup: package resolution completed in %s", time.Since(setupStart))
 	if interpretationError != nil {
 		return "", "", "", nil, interpretationError
 	}
