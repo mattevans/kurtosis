@@ -116,6 +116,9 @@ const (
 	parallelFlagKey = "parallel"
 	parallelDefault = "false"
 
+	resourceCheckFlagKey = "resource-check"
+	resourceCheckDefault = "true"
+
 	packageArgsFileFlagKey      = "args-file"
 	packageArgsFileDefaultValue = ""
 
@@ -262,6 +265,12 @@ var StarlarkRunCmd = &engine_consuming_kurtosis_command.EngineConsumingKurtosisC
 			Default: parallelDefault,
 		},
 		{
+			Key:     resourceCheckFlagKey,
+			Usage:   "If true, checks available CPU and memory before execution. Disable with --resource-check=false to save ~2s",
+			Type:    flags.FlagType_Bool,
+			Default: resourceCheckDefault,
+		},
+		{
 			Key:     outputGraphFlagKey,
 			Usage:   "If true, outputs a graph image of instructions as nodes and edges specifying dependencies between them",
 			Type:    flags.FlagType_Bool,
@@ -404,6 +413,11 @@ func run(
 		return stacktrace.Propagate(err, "Expected a value for the '%v' flag but failed to get it", parallelFlagKey)
 	}
 
+	resourceCheck, err := flags.GetBool(resourceCheckFlagKey)
+	if err != nil {
+		return stacktrace.Propagate(err, "Expected a value for the '%v' flag but failed to get it", resourceCheckFlagKey)
+	}
+
 	shouldOutputGraph, err := flags.GetBool(outputGraphFlagKey)
 	if err != nil {
 		return stacktrace.Propagate(err, "Expected a value for the '%v' flag but failed to get it", outputGraphFlagKey)
@@ -439,17 +453,25 @@ func run(
 		starlark_run_config.WithImageDownloadMode(*imageDownload),
 		starlark_run_config.WithNonBlockingMode(nonBlockingMode),
 		starlark_run_config.WithParallel(isParallel),
+		starlark_run_config.WithResourceCheck(resourceCheck),
 	)
 
+	runTotalStart := time.Now()
+	logrus.Infof("[BENCH] kurtosis run starting")
+
+	connectStart := time.Now()
 	kurtosisCtx, err := kurtosis_context.NewKurtosisContextFromLocalEngine()
 	if err != nil {
 		return stacktrace.Propagate(err, "An error occurred connecting to the local Kurtosis engine")
 	}
+	logrus.Infof("[BENCH] engine connect completed in %s", time.Since(connectStart))
 
+	enclaveStart := time.Now()
 	enclaveCtx, isNewEnclave, err := getOrCreateEnclaveContext(ctx, userRequestedEnclaveIdentifier, kurtosisCtx, isProduction)
 	if err != nil {
 		return stacktrace.Propagate(err, "An error occurred getting the enclave context for enclave '%v'", userRequestedEnclaveIdentifier)
 	}
+	logrus.Infof("[BENCH] enclave creation completed in %s", time.Since(enclaveStart))
 
 	if showEnclaveInspect {
 		defer func() {
@@ -557,6 +579,7 @@ func run(
 		connect = kurtosis_core_rpc_api_bindings.Connect_NO_CONNECT
 	}
 
+	executeStart := time.Now()
 	if isRemotePackage {
 		responseLineChan, cancelFunc, errRunningKurtosis = executeRemotePackage(ctx, enclaveCtx, starlarkScriptOrPackagePath, starlarkRunConfig)
 	} else {
@@ -586,8 +609,10 @@ func run(
 	if errRunningKurtosis != nil {
 		return stacktrace.Propagate(errRunningKurtosis, "An error starting the Kurtosis code execution '%v'", starlarkScriptOrPackagePath)
 	}
+	logrus.Infof("[BENCH] execute call (upload+start stream) completed in %s", time.Since(executeStart))
 
 	errRunningKurtosis = ReadAndPrintResponseLinesUntilClosed(responseLineChan, cancelFunc, verbosity, dryRun, isParallel)
+	logrus.Infof("[BENCH] starlark run stream completed in %s (total wall clock: %s)", time.Since(executeStart), time.Since(runTotalStart))
 
 	if err = enclaveCtx.ConnectServices(ctx, connect); err != nil {
 		logrus.Warnf("An error occurred configuring the user services port forwarding\nError was: %v", err)

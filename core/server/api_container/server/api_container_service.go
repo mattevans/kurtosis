@@ -160,6 +160,7 @@ func (apicService *ApiContainerService) RunStarlarkScript(args *kurtosis_core_rp
 	nonBlockingMode := args.GetNonBlockingMode()
 	downloadMode := convertFromImageDownloadModeAPI(ApiDownloadMode)
 	shouldExecuteInParallel := args.GetParallel()
+	scriptResourceCheck := args.ResourceCheck == nil || args.GetResourceCheck()
 
 	metricsErr := apicService.metricsClient.TrackKurtosisRun(startosis_constants.PackageIdPlaceholderForStandaloneScript, isNotRemote, dryRun, isScript, serializedParams)
 	if metricsErr != nil {
@@ -179,6 +180,7 @@ func (apicService *ApiContainerService) RunStarlarkScript(args *kurtosis_core_rp
 		downloadMode,
 		nonBlockingMode,
 		shouldExecuteInParallel,
+		scriptResourceCheck,
 		experimentalFeatures,
 		stream,
 	)
@@ -238,6 +240,7 @@ func (apicService *ApiContainerService) saveStarlarkRun(
 
 // Uploads a Starlark package for later execution
 func (apicService *ApiContainerService) UploadStarlarkPackage(server kurtosis_core_rpc_api_bindings.ApiContainerService_UploadStarlarkPackageServer) error {
+	uploadStart := time.Now()
 	var packageId string
 	serverStream := grpc_file_streaming.NewServerStream[kurtosis_core_rpc_api_bindings.StreamedDataChunk, emptypb.Empty](server)
 
@@ -257,10 +260,12 @@ func (apicService *ApiContainerService) UploadStarlarkPackage(server kurtosis_co
 			}
 
 			// finished receiving all the chunks and assembling them into a single byte array
+			storeStart := time.Now()
 			_, interpretationError := apicService.packageContentProvider.StorePackageContents(packageId, assembledContent, doOverwriteExistingModule)
 			if interpretationError != nil {
 				return nil, stacktrace.Propagate(interpretationError, "Error storing package in APIC once received")
 			}
+			logrus.Infof("[BENCH] package store/decompress completed in %s", time.Since(storeStart))
 			return &emptypb.Empty{}, nil
 		},
 	)
@@ -268,6 +273,7 @@ func (apicService *ApiContainerService) UploadStarlarkPackage(server kurtosis_co
 	if err != nil {
 		return stacktrace.Propagate(err, "An error occurred receiving the Starlark package payload")
 	}
+	logrus.Infof("[BENCH] UploadStarlarkPackage total completed in %s", time.Since(uploadStart))
 	return nil
 }
 
@@ -302,6 +308,8 @@ func (apicService *ApiContainerService) InspectFilesArtifactContents(_ context.C
 }
 
 func (apicService *ApiContainerService) RunStarlarkPackage(args *kurtosis_core_rpc_api_bindings.RunStarlarkPackageArgs, stream kurtosis_core_rpc_api_bindings.ApiContainerService_RunStarlarkPackageServer) error {
+	runPkgStart := time.Now()
+	logrus.Infof("[BENCH] RunStarlarkPackage handler starting")
 
 	var scriptWithRunFunction string
 	var interpretationError *startosis_errors.InterpretationError
@@ -321,6 +329,7 @@ func (apicService *ApiContainerService) RunStarlarkPackage(args *kurtosis_core_r
 	downloadMode := convertFromImageDownloadModeAPI(ApiDownloadMode)
 	nonBlockingMode := args.GetNonBlockingMode()
 	shouldExecuteInParallel := args.GetParallel()
+	resourceCheck := args.ResourceCheck == nil || args.GetResourceCheck() // defaults to true if not set
 
 	packageGitHubAuthToken := args.GetGithubAuthToken()
 	if packageGitHubAuthToken != "" {
@@ -365,6 +374,7 @@ func (apicService *ApiContainerService) RunStarlarkPackage(args *kurtosis_core_r
 		actualRelativePathToMainFile,
 		scriptWithRunFunction,
 		serializedParams)
+	logrus.Infof("[BENCH] RunStarlarkPackage setup completed in %s", time.Since(runPkgStart))
 	apicService.runStarlark(
 		int(parallelism),
 		dryRun,
@@ -377,8 +387,10 @@ func (apicService *ApiContainerService) RunStarlarkPackage(args *kurtosis_core_r
 		downloadMode,
 		nonBlockingMode,
 		shouldExecuteInParallel,
+		resourceCheck,
 		args.ExperimentalFeatures,
 		stream)
+	logrus.Infof("[BENCH] RunStarlarkPackage total completed in %s", time.Since(runPkgStart))
 
 	return nil
 }
@@ -959,20 +971,25 @@ func (apicService *ApiContainerService) runStarlarkPackageSetup(
 	string, // Detected Package ID detected from [clonePackage] or [moduleContentIfLocal]
 	map[string]string, // Replace options detected from [clonePackage] or [moduleContentIfLocal]
 	*startosis_errors.InterpretationError) {
+	setupStart := time.Now()
 	var packageRootPathOnDisk string
 	var interpretationError *startosis_errors.InterpretationError
 
 	if clonePackage {
+		logrus.Infof("[BENCH] runStarlarkPackageSetup: cloning package '%s'", packageIdFromArgs)
 		packageRootPathOnDisk, interpretationError = apicService.packageContentProvider.ClonePackage(packageIdFromArgs)
 	} else if moduleContentIfLocal != nil {
+		logrus.Infof("[BENCH] runStarlarkPackageSetup: storing local module content for '%s'", packageIdFromArgs)
 		// TODO: remove this once UploadStarlarkPackage is called prior to calling RunStarlarkPackage by all consumers of this API
 		packageRootPathOnDisk, interpretationError = apicService.packageContentProvider.StorePackageContents(packageIdFromArgs, bytes.NewReader(moduleContentIfLocal), doOverwriteExistingModule)
 	} else {
+		logrus.Infof("[BENCH] runStarlarkPackageSetup: getting on-disk path for '%s'", packageIdFromArgs)
 		// We just need to retrieve the absolute path, the content will not be stored here since it has been uploaded prior to this call
 		// This is used in the flow where we `replace` with a local call, in which case we need to store multiple packages on the APIC
 		// before we actually do the run
 		packageRootPathOnDisk, interpretationError = apicService.packageContentProvider.GetOnDiskAbsolutePackagePath(packageIdFromArgs)
 	}
+	logrus.Infof("[BENCH] runStarlarkPackageSetup: package resolution completed in %s", time.Since(setupStart))
 	if interpretationError != nil {
 		return "", "", "", nil, interpretationError
 	}
@@ -1039,10 +1056,11 @@ func (apicService *ApiContainerService) runStarlark(
 	imageDownloadMode image_download_mode.ImageDownloadMode,
 	nonBlockingMode bool,
 	shouldExecuteInParallel bool,
+	resourceCheck bool,
 	experimentalFeatures []kurtosis_core_rpc_api_bindings.KurtosisFeatureFlag,
 	stream grpc.ServerStream,
 ) {
-	responseLineStream := apicService.startosisRunner.Run(stream.Context(), dryRun, parallelism, packageId, packageReplaceOptions, mainFunctionName, relativePathToMainFile, serializedStarlark, serializedParams, imageDownloadMode, nonBlockingMode, shouldExecuteInParallel, experimentalFeatures)
+	responseLineStream := apicService.startosisRunner.Run(stream.Context(), dryRun, parallelism, packageId, packageReplaceOptions, mainFunctionName, relativePathToMainFile, serializedStarlark, serializedParams, imageDownloadMode, nonBlockingMode, shouldExecuteInParallel, resourceCheck, experimentalFeatures)
 	for {
 		select {
 		case <-stream.Context().Done():

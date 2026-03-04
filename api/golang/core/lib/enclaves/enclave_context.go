@@ -19,11 +19,14 @@ package enclaves
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
+	"time"
 
 	path_compression "github.com/kurtosis-tech/kurtosis/path-compression"
 
@@ -38,6 +41,63 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
+
+const (
+	archiveCacheDirName  = "archive-cache"
+	cacheDirPermissions  = os.FileMode(0o755)
+	cacheFilePermissions = os.FileMode(0o644)
+)
+
+// getArchiveCacheDir returns the path to the archive cache directory.
+// Archives are cached by content hash so they can be reused across enclaves.
+func getArchiveCacheDir() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", stacktrace.Propagate(err, "Failed to get user home directory")
+	}
+	cacheDir := filepath.Join(homeDir, ".kurtosis", archiveCacheDirName)
+	if err := os.MkdirAll(cacheDir, cacheDirPermissions); err != nil {
+		return "", stacktrace.Propagate(err, "Failed to create archive cache directory '%s'", cacheDir)
+	}
+	return cacheDir, nil
+}
+
+// getCachedArchive returns the path to a cached compressed archive for the given content hash.
+// Returns empty string if no cache exists or the file is missing.
+func getCachedArchive(contentHashHex string) string {
+	cacheDir, err := getArchiveCacheDir()
+	if err != nil {
+		return ""
+	}
+	archivePath := filepath.Join(cacheDir, contentHashHex+".tgz")
+	if _, err := os.Stat(archivePath); err != nil {
+		return ""
+	}
+	return archivePath
+}
+
+// cacheArchive copies a compressed archive to the cache directory, keyed by content hash.
+func cacheArchive(contentHashHex string, sourcePath string) {
+	cacheDir, err := getArchiveCacheDir()
+	if err != nil {
+		return
+	}
+	destPath := filepath.Join(cacheDir, contentHashHex+".tgz")
+
+	src, err := os.Open(sourcePath)
+	if err != nil {
+		return
+	}
+	defer src.Close()
+
+	dst, err := os.Create(destPath)
+	if err != nil {
+		return
+	}
+	defer dst.Close()
+
+	_, _ = io.Copy(dst, src)
+}
 
 type EnclaveUUID string
 
@@ -118,7 +178,8 @@ func (enclaveCtx *EnclaveContext) RunStarlarkScript(
 		runConfig.CloudUserId,
 		runConfig.ImageDownload,
 		runConfig.NonBlockingMode,
-		runConfig.Parallel)
+		runConfig.Parallel,
+		runConfig.ResourceCheck)
 	starlarkResponseLineChan := make(chan *kurtosis_core_rpc_api_bindings.StarlarkRunResponseLine)
 
 	stream, err := enclaveCtx.client.RunStarlarkScript(ctxWithCancel, executeStartosisScriptArgs)
@@ -181,15 +242,18 @@ func (enclaveCtx *EnclaveContext) RunStarlarkPackage(
 		runConfig.ImageDownload,
 		runConfig.NonBlockingMode,
 		runConfig.GitHubAuthToken,
-		runConfig.Parallel)
+		runConfig.Parallel,
+		runConfig.ResourceCheck)
 	if err != nil {
 		return nil, nil, stacktrace.Propagate(err, "Error preparing package '%s' for execution", packageRootPath)
 	}
 
+	uploadStart := time.Now()
 	err = enclaveCtx.uploadStarlarkPackage(executeStartosisPackageArgs.PackageId, packageRootPath)
 	if err != nil {
 		return nil, nil, stacktrace.Propagate(err, "Error uploading package '%s' prior to executing it", packageRootPath)
 	}
+	logrus.Infof("[BENCH] client-side uploadStarlarkPackage completed in %s", time.Since(uploadStart))
 
 	if len(packageReplaceOptions) > 0 {
 		if err = enclaveCtx.uploadLocalStarlarkPackageDependencies(packageRootPath, packageReplaceOptions); err != nil {
@@ -304,7 +368,7 @@ func (enclaveCtx *EnclaveContext) RunStarlarkRemotePackage(
 	}()
 
 	starlarkResponseLineChan := make(chan *kurtosis_core_rpc_api_bindings.StarlarkRunResponseLine)
-	executeStartosisScriptArgs := binding_constructors.NewRunStarlarkRemotePackageArgs(packageId, runConfig.RelativePathToMainFile, runConfig.MainFunctionName, serializedParams, runConfig.DryRun, runConfig.Parallelism, runConfig.ExperimentalFeatureFlags, runConfig.CloudInstanceId, runConfig.CloudUserId, runConfig.ImageDownload, runConfig.NonBlockingMode, runConfig.Parallel, runConfig.GitHubAuthToken)
+	executeStartosisScriptArgs := binding_constructors.NewRunStarlarkRemotePackageArgs(packageId, runConfig.RelativePathToMainFile, runConfig.MainFunctionName, serializedParams, runConfig.DryRun, runConfig.Parallelism, runConfig.ExperimentalFeatureFlags, runConfig.CloudInstanceId, runConfig.CloudUserId, runConfig.ImageDownload, runConfig.NonBlockingMode, runConfig.Parallel, runConfig.ResourceCheck, runConfig.GitHubAuthToken)
 
 	stream, err := enclaveCtx.client.RunStarlarkPackage(ctxWithCancel, executeStartosisScriptArgs)
 	if err != nil {
@@ -673,6 +737,7 @@ func (enclaveCtx *EnclaveContext) assembleRunStartosisPackageArg(
 	nonBlockingMode bool,
 	githubAuthToken string,
 	parallel bool,
+	resourceCheck bool,
 ) (*kurtosis_core_rpc_api_bindings.RunStarlarkPackageArgs, error) {
 
 	return binding_constructors.NewRunStarlarkPackageArgs(
@@ -688,19 +753,63 @@ func (enclaveCtx *EnclaveContext) assembleRunStartosisPackageArg(
 		imageDownloadMode,
 		nonBlockingMode,
 		parallel,
+		resourceCheck,
 		githubAuthToken), nil
 }
 
 func (enclaveCtx *EnclaveContext) uploadStarlarkPackage(packageId string, packageRootPath string) error {
-	logrus.Infof("Compressing package '%v' at '%v' for upload", packageId, packageRootPath)
-	compressedModule, commpressedModuleSize, _, err := path_compression.CompressPath(packageRootPath, enforceMaxFileSizeLimit)
+	uploadTotalStart := time.Now()
+	logrus.Infof("[BENCH] uploadStarlarkPackage starting for '%v' at '%v'", packageId, packageRootPath)
+
+	// Compute content hash first (fast — only reads files, no compression)
+	hashStart := time.Now()
+	contentHash, err := path_compression.ComputeContentHash(packageRootPath)
 	if err != nil {
-		return stacktrace.Propagate(err, "There was an error compressing module '%v' before upload", packageRootPath)
+		return stacktrace.Propagate(err, "An error occurred computing content hash for package '%v'", packageRootPath)
+	}
+	contentHashHex := hex.EncodeToString(contentHash)
+	logrus.Infof("[BENCH] content hash computed in %s (hash=%s)", time.Since(hashStart), contentHashHex)
+
+	// Check if we have a cached compressed archive for this content hash.
+	// This saves ~2.5s of compression even when uploading to a brand new enclave.
+	var compressedModule io.ReadCloser
+	var compressedModuleSize uint64
+
+	cachedArchivePath := getCachedArchive(contentHashHex)
+	if cachedArchivePath != "" {
+		logrus.Infof("[BENCH] archive cache hit for hash=%s, skipping compression", contentHashHex)
+		fileInfo, statErr := os.Stat(cachedArchivePath)
+		if statErr == nil {
+			file, openErr := os.Open(cachedArchivePath)
+			if openErr == nil {
+				compressedModule = file
+				compressedModuleSize = uint64(fileInfo.Size())
+			}
+		}
+	}
+
+	if compressedModule == nil {
+		// Cache miss — compress from scratch
+		compressStart := time.Now()
+		compressedFilePath, fileSize, _, compressErr := path_compression.CompressPathToFile(packageRootPath, enforceMaxFileSizeLimit)
+		if compressErr != nil {
+			return stacktrace.Propagate(compressErr, "There was an error compressing module '%v' before upload", packageRootPath)
+		}
+		logrus.Infof("[BENCH] package compression completed in %s (size=%d bytes)", time.Since(compressStart), fileSize)
+
+		// Cache the archive for next time
+		cacheArchive(contentHashHex, compressedFilePath)
+
+		file, openErr := os.Open(compressedFilePath)
+		if openErr != nil {
+			return stacktrace.Propagate(openErr, "Failed to open compressed archive at '%s'", compressedFilePath)
+		}
+		compressedModule = file
+		compressedModuleSize = fileSize
 	}
 	defer compressedModule.Close()
-	logrus.Infof("Uploading and executing package '%v'", packageId)
 
-	// TODO: add content hash to API here as well
+	streamStart := time.Now()
 	client, err := enclaveCtx.client.UploadStarlarkPackage(context.Background())
 	if err != nil {
 		return stacktrace.Propagate(err, "An error was encountered initiating the data upload to the API Container.")
@@ -709,7 +818,7 @@ func (enclaveCtx *EnclaveContext) uploadStarlarkPackage(packageId string, packag
 	_, err = clientStream.SendData(
 		packageId,
 		compressedModule,
-		commpressedModuleSize,
+		compressedModuleSize,
 		func(previousChunkHash string, contentChunk []byte) (*kurtosis_core_rpc_api_bindings.StreamedDataChunk, error) {
 			return &kurtosis_core_rpc_api_bindings.StreamedDataChunk{
 				Data:              contentChunk,
@@ -723,6 +832,9 @@ func (enclaveCtx *EnclaveContext) uploadStarlarkPackage(packageId string, packag
 	if err != nil {
 		return stacktrace.Propagate(err, "An error was encountered while uploading data to the API Container.")
 	}
+	logrus.Infof("[BENCH] package stream upload completed in %s", time.Since(streamStart))
+
+	logrus.Infof("[BENCH] uploadStarlarkPackage total completed in %s", time.Since(uploadTotalStart))
 	return nil
 }
 

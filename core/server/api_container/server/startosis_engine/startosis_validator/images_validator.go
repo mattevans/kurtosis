@@ -3,6 +3,7 @@ package startosis_validator
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/kurtosis-tech/kurtosis/container-engine-lib/lib/backend_interface/objects/image_build_spec"
 	"github.com/kurtosis-tech/kurtosis/container-engine-lib/lib/backend_interface/objects/image_registry_spec"
@@ -49,6 +50,12 @@ func (validator *ImagesValidator) Validate(
 		close(imageValidationFinished)
 		close(imageValidationErrors)
 		close(imageCurrentlyValidating)
+	}()
+
+	imageValidateStart := time.Now()
+	logrus.Infof("[BENCH] ImagesValidator.Validate starting (pull=%d, build=%d, nix=%d)", len(environment.imagesToPull), len(environment.imagesToBuild), len(environment.nixToBuild))
+	defer func() {
+		logrus.Infof("[BENCH] ImagesValidator.Validate completed in %s", time.Since(imageValidateStart))
 	}()
 
 	wg := &sync.WaitGroup{}
